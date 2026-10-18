@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pocket Katana - Camera</title>
+<style>
+  :root { --ink:#e9edff; --night:#0b1026; --panel:#121a45; --blue:#4aa3ff; --red:#ff5a5a; --ok:#6be28f; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; background:var(--night); color:var(--ink); font-family: system-ui, "Segoe UI", sans-serif; }
+  main { max-width:720px; margin:0 auto; padding:20px 16px 40px; }
+  h1 { font:900 clamp(32px,7vw,52px)/1 Impact, "Arial Narrow Bold", sans-serif; margin:8px 0 16px; }
+  p { color:#aeb6e6; line-height:1.5; margin:0 0 16px; }
+  label { display:flex; gap:10px; align-items:center; margin:10px 0; }
+  button { font:700 20px system-ui, sans-serif; padding:14px 22px; border:0; border-radius:12px; background:var(--blue); color:#06122e; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--ink); border:2px solid #3a4486; font-size:16px; padding:10px 16px; }
+  button:disabled { opacity:.5; cursor:default; }
+  button:focus-visible, input:focus-visible { outline:3px solid var(--blue); outline-offset:3px; }
+  #codeBox { background:var(--panel); border-radius:16px; padding:18px; margin:16px 0; text-align:center; }
+  #code { font:700 clamp(56px,16vw,96px)/1 ui-monospace, Menlo, Consolas, monospace; letter-spacing:.25em; padding-left:.25em; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; margin:12px 0; }
+  .chip { padding:6px 12px; border-radius:999px; background:var(--panel); font-size:15px; }
+  .chip.ok { background:#16422a; color:var(--ok); }
+  canvas { width:100%; border-radius:12px; background:#000; display:block; }
+  #msg { min-height:1.5em; color:#ffd48a; }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>CAMERA</h1>
+
+  <section id="setup">
+    <p>Prop this device up facing the players, a few meters back, so both players' whole bodies are in view. Landscape works best. Keep the lights on.</p>
+    <label><input type="checkbox" id="lefty"> Sword in left hand</label>
+    <label><input type="checkbox" id="preview" checked> Show camera preview (turn off to save battery)</label>
+    <button id="go">Start camera</button>
+  </section>
+
+  <section id="live" hidden>
+    <div id="codeBox">
+      <div>Enter this code on the display at <b id="displayUrl"></b></div>
+      <div id="code" aria-live="polite">----</div>
+    </div>
+    <div class="row">
+      <span class="chip" id="cDisplay">Display: waiting</span>
+      <span class="chip" id="cP1">Player 1: not seen</span>
+      <span class="chip" id="cP2">Player 2: not seen</span>
+      <span class="chip" id="cFps">-- fps</span>
+    </div>
+    <p id="msg"></p>
+    <canvas id="view" width="640" height="480"></canvas>
+    <div class="row"><button class="ghost" id="reset">Re-detect players</button></div>
+  </section>
+</main>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker, PoseLandmarker }
+  from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+import { Net } from './net.js';
+
+const WASM = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
+// Self-host these two files for a real launch so you don't depend on Google's bucket.
+const POSE_MODEL = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
+const HAND_MODEL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+
+const $ = (id) => document.getElementById(id);
+const video = document.createElement('video');
+video.playsInline = true; video.muted = true;
+const canvas = $('view'), ctx = canvas.getContext('2d');
+
+// Pose landmark indices we send, in order: nose, shoulders, elbows, wrists, hips, knees, ankles.
+const KEYS = [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28];
+const r3 = (v) => Math.round(v * 1000) / 1000;
+const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+let W = 640, H = 480;
+let pose, hands, net;
+let room = { code: null, token: null };
+let displayUp = false;
+let calibrated = false;
+let tracks = [null, null];
+let poseEvery = 1, frameNo = 0, lastVideoTime = -1;
+let fpsCount = 0, fpsStart = performance.now();
+let lefty = false, showPreview = true;
+let lastPose = { people: [] }, lastHands = [];
+
+// ---------- start ----------
+$('go').addEventListener('click', async () => {
+  $('go').disabled = true;
+  lefty = $('lefty').checked;
+  showPreview = $('preview').checked;
+  try {
+    $('go').textContent = 'Opening camera...';
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } },
+      audio: false,
+    });
+    video.srcObject = stream;
+    await video.play();
+    W = video.videoWidth; H = video.videoHeight;
+    canvas.width = W; canvas.height = H;
+    stream.getVideoTracks()[0].addEventListener('ended', () => say('The camera stopped. Reload this page.'));
+
+    $('go').textContent = 'Loading tracking models...';
+    const fileset = await FilesetResolver.forVisionTasks(WASM);
+    pose = await make(PoseLandmarker, fileset, POSE_MODEL, { numPoses: 2 });
+    hands = await make(HandLandmarker, fileset, HAND_MODEL, { numHands: 4 });
+
+    $('setup').hidden = true;
+    $('live').hidden = false;
+    $('displayUrl').textContent = location.origin + '/display';
+    keepAwake();
+    connect();
+    requestAnimationFrame(tick);
+  } catch (e) {
+    console.error(e);
+    $('go').disabled = false;
+    $('go').textContent = 'Start camera';
+    alert(e && e.name === 'NotAllowedError'
+      ? 'Camera permission was denied. Allow camera access in your browser settings and try again.'
+      : 'Could not start: ' + (e && e.message ? e.message : e) + '\n(Cameras need HTTPS, or localhost.)');
+  }
+});
+
+async function make(Cls, fileset, model, extra) {
+  for (const delegate of ['GPU', 'CPU']) {
+    try {
+      return await Cls.createFromOptions(fileset, { baseOptions: { modelAssetPath: model, delegate }, runningMode: 'VIDEO', ...extra });
+    } catch (e) { console.warn(Cls.name, delegate, e); }
+  }
+  throw new Error('Could not load the tracking model');
+}
+
+async function keepAwake() {
+  try { if ('wakeLock' in navigator) await navigator.wakeLock.request('screen'); } catch { /* optional */ }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') keepAwake();
+  }, { once: true });
+}
+
+$('reset').addEventListener('click', () => { calibrated = false; tracks = [null, null]; });
+
+// ---------- networking ----------
+function connect() {
+  net = new Net(onMsg, (s) => { if (s === 'closed') { displayUp = false; chip('cDisplay', 'Display: reconnecting', false); } });
+  net.onOpen = () => {
+    const saved = JSON.parse(sessionStorage.getItem('pk-room') || 'null');
+    net.send(saved ? { type: 'resume', code: saved.code, token: saved.token } : { type: 'create' });
+  };
+  net.connect();
+}
+
+function onMsg(m) {
+  switch (m.type) {
+    case 'code':
+      room = { code: m.code, token: m.token };
+      sessionStorage.setItem('pk-room', JSON.stringify(room));
+      $('code').textContent = m.code;
+      break;
+    case 'ready': displayUp = true; chip('cDisplay', 'Display: connected', true); break;
+    case 'peer_left': displayUp = false; chip('cDisplay', 'Display: waiting', false); break;
+    case 'status': say(m.text); break;
+    case 'closed':
+    case 'error':
+      if (m.type === 'error' && m.message !== 'expired') return say(m.message);
+      sessionStorage.removeItem('pk-room');   // room is gone: make a fresh one
+      net.send({ type: 'create' });
+      break;
+  }
+}
+
+function chip(id, text, ok) { const el = $(id); el.textContent = text; el.classList.toggle('ok', !!ok); }
+function say(t) { $('msg').textContent = t || ''; }
+
+// ---------- tracking loop ----------
+function tick() {
+  requestAnimationFrame(tick);
+  if (video.readyState < 2 || video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  const now = performance.now();
+
+  if (frameNo++ % poseEvery === 0) {
+    lastPose = { people: toPeople(pose.detectForVideo(video, now)) };
+    updateTracks(lastPose.people, now);
+  }
+  lastHands = (hands.detectForVideo(video, now).landmarks || [])
+    .map((h) => h.map((l) => ({ x: (1 - l.x) * W, y: l.y * H })));
+
+  const players = [buildPlayer(1, now), buildPlayer(2, now)];
+  if (displayUp && net) net.send({ type: 'state', d: { w: players.map((p) => p.msg) } });
+
+  if (showPreview) draw(players);
+  chip('cP1', 'Player 1: ' + (players[0].msg.on ? 'ready' : 'not seen'), players[0].msg.on);
+  chip('cP2', 'Player 2: ' + (players[1].msg.on ? 'ready' : 'not seen'), players[1].msg.on);
+  if (!calibrated) say(lastPose.people.length < 2 ? 'Waiting for two players. Stand apart, full body in view.' : 'Stand a bit further apart...');
+  else if (!($('msg').textContent && displayUp)) say('');
+
+  fpsCount++;
+  if (now - fpsStart > 1000) {
+    const fps = fpsCount * 1000 / (now - fpsStart);
+    $('cFps').textContent = Math.round(fps) + ' fps';
+    poseEvery = fps < 18 ? 2 : fps > 26 ? 1 : poseEvery;   // adapt: run pose less often on slow devices
+    fpsCount = 0; fpsStart = now;
+  }
+}
+
+// Convert MediaPipe output to mirrored pixel space (so the stickman acts like a mirror).
+function toPeople(res) {
+  const out = [];
+  for (const lm of res.landmarks || []) {
+    const p = lm.map((l) => ({ x: (1 - l.x) * W, y: l.y * H, v: l.visibility ?? 1 }));
+    if (p[11].v < 0.4 || p[12].v < 0.4 || p[23].v < 0.3 || p[24].v < 0.3) continue; // need torso in view
+    const hip = mid(p[23], p[24]), sh = mid(p[11], p[12]);
+    out.push({ p, hip, torso: Math.hypot(hip.x - sh.x, hip.y - sh.y) });
+  }
+  return out;
+}
+
+// Identity: lock P1 = left, P2 = right once, then follow each person by nearest predicted hip.
+function updateTracks(people, now) {
+  if (!calibrated) {
+    if (people.length < 2) return;
+    const s = [...people].sort((a, b) => a.hip.x - b.hip.x);
+    const L = s[0], R = s[s.length - 1];
+    if (R.hip.x - L.hip.x < W * 0.2) return;
+    tracks = [newTrack(L, now), newTrack(R, now)];
+    calibrated = true;
+    return;
+  }
+  const pick = [...people].sort((a, b) => b.torso - a.torso).slice(0, 2);
+  const cost = (person, t) => {
+    const lead = clamp(t.vx * (now - t.seen) / 1000, -W * 0.15, W * 0.15);
+    return Math.hypot(person.hip.x - (t.hip.x + lead), person.hip.y - t.hip.y);
+  };
+  if (pick.length === 2) {
+    const straight = cost(pick[0], tracks[0]) + cost(pick[1], tracks[1]);
+    const swapped = cost(pick[0], tracks[1]) + cost(pick[1], tracks[0]);
+    if (straight <= swapped) { apply(tracks[0], pick[0], now); apply(tracks[1], pick[1], now); }
+    else { apply(tracks[0], pick[1], now); apply(tracks[1], pick[0], now); }
+  } else if (pick.length === 1) {
+    const c0 = cost(pick[0], tracks[0]), c1 = cost(pick[0], tracks[1]);
+    const i = c0 <= c1 ? 0 : 1;
+    if (Math.min(c0, c1) < W * 0.3) apply(tracks[i], pick[0], now);
+  }
+}
+
+function newTrack(person, now) {
+  return { pts: person.p.map((q) => ({ ...q })), hip: { ...person.hip }, vx: 0, torso: person.torso, dir: [1, 0], seen: now };
+}
+
+function apply(t, person, now) {
+  const dt = Math.max((now - t.seen) / 1000, 0.001);
+  t.vx += (clamp((person.hip.x - t.hip.x) / dt, -3000, 3000) - t.vx) * 0.3;
+  t.hip = { ...person.hip };
+  t.pts.forEach((q, i) => {
+    q.x += (person.p[i].x - q.x) * 0.55;
+    q.y += (person.p[i].y - q.y) * 0.55;
+    q.v = person.p[i].v;
+  });
+  t.seen = now;
+}
+
+function buildPlayer(id, now) {
+  const t = tracks[id - 1];
+  if (!t || now - t.seen > 600) return { msg: { p: id, on: false } };
+  const P = t.pts, hip = mid(P[23], P[24]), sh = mid(P[11], P[12]);
+  t.torso += (Math.hypot(hip.x - sh.x, hip.y - sh.y) - t.torso) * 0.15;
+  const torso = Math.max(t.torso, 30);
+
+  // Blade direction: the detected hand nearest to our sword-hand wrist, else the forearm.
+  const wi = lefty ? 15 : 16, ei = lefty ? 13 : 14, wr = P[wi];
+  let best = null, bd = Infinity;
+  for (const h of lastHands) {
+    const d = Math.hypot(h[0].x - wr.x, h[0].y - wr.y);
+    if (d < bd) { bd = d; best = h; }
+  }
+  let dx, dy;
+  if (best && bd < torso * 0.8) { dx = best[9].x - best[0].x; dy = best[9].y - best[0].y; }
+  else { dx = wr.x - P[ei].x; dy = wr.y - P[ei].y; }
+  const l = Math.hypot(dx, dy) || 1;
+  t.dir[0] += (dx / l - t.dir[0]) * 0.5;
+  t.dir[1] += (dy / l - t.dir[1]) * 0.5;
+
+  const pts = [];
+  for (const k of KEYS) pts.push(r3((P[k].x - hip.x) / torso), r3((P[k].y - hip.y) / torso));
+  return {
+    msg: { p: id, on: true, x: r3(clamp(hip.x / W, 0, 1)), pts, dir: [r3(t.dir[0]), r3(t.dir[1])], sh: lefty ? 5 : 6 },
+    base: wr, tip: { x: wr.x + t.dir[0] * torso * 2.2, y: wr.y + t.dir[1] * torso * 2.2 },
+    P,
+  };
+}
+
+// ---------- preview ----------
+const BONES = [[11, 12], [11, 13], [13, 15], [12, 14], [14, 16], [11, 23], [12, 24], [23, 24], [23, 25], [25, 27], [24, 26], [26, 28]];
+function draw(players) {
+  ctx.save();
+  ctx.translate(W, 0); ctx.scale(-1, 1);       // mirror the video to match the display
+  ctx.drawImage(video, 0, 0, W, H);
+  ctx.restore();
+  ['#4aa3ff', '#ff5a5a'].forEach((color, i) => {
+    const pl = players[i];
+    if (!pl.msg.on) return;
+    ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 4;
+    ctx.beginPath();
+    for (const [a, b] of BONES) { ctx.moveTo(pl.P[a].x, pl.P[a].y); ctx.lineTo(pl.P[b].x, pl.P[b].y); }
+    ctx.stroke();
+    ctx.lineWidth = 6;
+    ctx.beginPath(); ctx.moveTo(pl.base.x, pl.base.y); ctx.lineTo(pl.tip.x, pl.tip.y); ctx.stroke();
+    ctx.font = 'bold 22px system-ui'; ctx.fillText('P' + (i + 1), pl.P[0].x - 12, pl.P[0].y - 30);
+  });
+}
+</script>
+</body>
+</html>

@@ -1,1 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pocket Katana - sword duel with your webcam</title>
+<meta name="description" content="Fight a friend as a stickman. Your camera tracks your body, your hand becomes a 2 m katana. No install.">
+<style>
+  :root { --ink:#e9edff; --night:#0b1026; --panel:#121a45; --blue:#4aa3ff; --red:#ff5a5a; --gold:#d9b45a; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:linear-gradient(#0b1026,#3a1d4a 70%,#1b1220); color:var(--ink); font-family: system-ui, "Segoe UI", sans-serif; min-height:100vh; }
+  main { max-width:860px; margin:0 auto; padding:48px 20px 64px; }
+  h1 { font:900 clamp(56px,13vw,132px)/.9 Impact, "Arial Narrow Bold", sans-serif; margin:0 0 20px; letter-spacing:.01em; }
+  h1 .a { color:var(--blue); } h1 .b { color:var(--red); }
+  .lede { font-size:clamp(18px,2.6vw,22px); line-height:1.5; color:#cdd4ff; max-width:36em; margin:0 0 32px; }
+  .cta { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:48px; }
+  a.btn { font:700 20px system-ui, sans-serif; padding:16px 24px; border-radius:12px; text-decoration:none; background:var(--blue); color:#06122e; }
+  a.btn.alt { background:transparent; color:var(--ink); border:2px solid #4a55a0; }
+  a:focus-visible { outline:3px solid var(--gold); outline-offset:3px; }
+  h2 { font-size:24px; margin:0 0 12px; }
+  ol, ul { padding-left:1.2em; line-height:1.6; color:#cdd4ff; max-width:40em; margin:0 0 36px; }
+  li { margin-bottom:6px; }
+  .safety { border-left:4px solid var(--gold); padding:4px 0 4px 16px; max-width:40em; color:#e8dcb0; line-height:1.6; }
+</style>
+</head>
+<body>
+<main>
+  <h1><span class="a">POCKET</span><br><span class="b">KATANA</span></h1>
+  <p class="lede">Stand in front of a camera, face a friend, and fight. Your body becomes a stickman, your hand becomes a 2 m sword. Slash to hit, cross blades to clash.</p>
+  <div class="cta">
+    <a class="btn" href="/start">I have the camera</a>
+    <a class="btn alt" href="/display">I have the screen</a>
+  </div>
 
+  <h2>How to play</h2>
+  <ol>
+    <li>Prop a phone or laptop up facing both players, a few meters back, so your whole bodies are in view.</li>
+    <li>Open <b>/start</b> on that device and tap Start camera. It shows a 4-digit code.</li>
+    <li>Open <b>/display</b> on the TV or laptop you want to watch on, and type the code. The same device can do both if you open two tabs.</li>
+    <li>Stand apart, one player on each side. When both of you are detected, the countdown begins.</li>
+    <li>Swing your sword hand fast to slash. First to win two rounds wins the match.</li>
+  </ol>
+
+  <h2>Safety</h2>
+  <div class="safety">
+    <p>Clear the space around you before you start. Use your bare hand, or a light foam item. Never swing a hard object near people, and keep your elbows in when you are close. Take breaks, matches are tiring.</p>
+  </div>
+</main>
+</body>
+</html>

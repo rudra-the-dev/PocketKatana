@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pocket Katana - Display</title>
+<style>
+  :root { --ink:#e9edff; --night:#0b1026; --blue:#4aa3ff; --red:#ff5a5a; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:#000; color:var(--ink); font-family: system-ui, "Segoe UI", sans-serif; overflow:hidden; }
+  canvas { position:fixed; inset:0; display:block; }
+  #gate { position:fixed; inset:0; display:grid; place-items:center; background:rgba(5,8,24,.92); z-index:2; padding:24px; }
+  #gate[hidden] { display:none; }
+  form { width:min(440px,100%); text-align:center; }
+  h1 { font:900 clamp(40px,8vw,72px)/1 Impact, "Arial Narrow Bold", sans-serif; letter-spacing:.02em; margin:0 0 8px; }
+  p { margin:0 0 24px; color:#aeb6e6; line-height:1.5; }
+  input { width:100%; font:700 56px/1.2 ui-monospace, Menlo, Consolas, monospace; letter-spacing:.35em; text-align:center; padding:12px 8px 12px 24px; border-radius:12px; border:2px solid #3a4486; background:#121a45; color:var(--ink); }
+  input:focus-visible, button:focus-visible { outline:3px solid var(--blue); outline-offset:3px; }
+  button { margin-top:16px; width:100%; font:700 22px system-ui, sans-serif; padding:16px; border:0; border-radius:12px; background:var(--blue); color:#06122e; cursor:pointer; }
+  #err { min-height:1.5em; margin:12px 0 0; color:#ff9a9a; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="gate">
+  <form id="join" autocomplete="off">
+    <h1>POCKET KATANA</h1>
+    <p>Open <b>/start</b> on the phone or laptop that has the camera. Type the 4-digit code it shows.</p>
+    <input id="code" inputmode="numeric" pattern="\d{4}" maxlength="4" placeholder="0000" aria-label="4-digit room code" required>
+    <button type="submit">Join room</button>
+    <div id="err" role="alert"></div>
+  </form>
+</div>
+<script type="module" src="display.js"></script>
+</body>
+</html>
