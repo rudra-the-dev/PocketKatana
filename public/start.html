@@ -34,6 +34,7 @@
     <p>Prop this device up facing the players, a few meters back, so both players' whole bodies are in view. Landscape works best. Keep the lights on.</p>
     <label><input type="checkbox" id="lefty"> Sword in left hand</label>
     <label><input type="checkbox" id="preview" checked> Show camera preview (turn off to save battery)</label>
+    <label><input type="checkbox" id="solo"> Practice alone (a dummy stands in as Player 2)</label>
     <button id="go">Start camera</button>
   </section>
 
@@ -50,7 +51,7 @@
     </div>
     <p id="msg"></p>
     <canvas id="view" width="640" height="480"></canvas>
-    <div class="row"><button class="ghost" id="reset">Re-detect players</button></div>
+    <div class="row"><button class="ghost" id="rotate">Rotate view</button><button class="ghost" id="reset">Re-detect players</button></div>
   </section>
 </main>
 
@@ -83,7 +84,7 @@ let calibrated = false;
 let tracks = [null, null];
 let poseEvery = 1, frameNo = 0, lastVideoTime = -1;
 let fpsCount = 0, fpsStart = performance.now();
-let lefty = false, showPreview = true;
+let lefty = false, showPreview = true, solo = false, rot = 0, curSrc = video;
 let lastPose = { people: [] }, lastHands = [];
 
 // ---------- start ----------
@@ -91,6 +92,7 @@ $('go').addEventListener('click', async () => {
   $('go').disabled = true;
   lefty = $('lefty').checked;
   showPreview = $('preview').checked;
+  solo = $('solo').checked;
   try {
     $('go').textContent = 'Opening camera...';
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -140,7 +142,30 @@ async function keepAwake() {
   }, { once: true });
 }
 
-$('reset').addEventListener('click', () => { calibrated = false; tracks = [null, null]; });
+function resetPlayers() { calibrated = false; tracks = [null, null]; }
+$('reset').addEventListener('click', resetPlayers);
+$('rotate').addEventListener('click', () => { rot = (rot + 90) % 360; resetPlayers(); say('View rotated to ' + rot + ' degrees'); });
+
+// Some phones hand us a sideways or upside-down image in landscape. Rotating the frame
+// before detection fixes that, because the pose model fails on rotated people.
+const off = document.createElement('canvas'), octx = off.getContext('2d');
+function frameSource() {
+  if (!rot) return video;
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const swap = rot === 90 || rot === 270;
+  const ow = swap ? vh : vw, oh = swap ? vw : vh;
+  if (off.width !== ow || off.height !== oh) { off.width = ow; off.height = oh; }
+  octx.save();
+  octx.translate(ow / 2, oh / 2);
+  octx.rotate(rot * Math.PI / 180);
+  octx.drawImage(video, -vw / 2, -vh / 2, vw, vh);
+  octx.restore();
+  return off;
+}
+const dimsOf = (src) => (src === video ? [video.videoWidth, video.videoHeight] : [src.width, src.height]);
+
+// Stand-in opponent for practice mode.
+const DUMMY = [0, -1.5, -.4, -1, .4, -1, -.5, -.5, .5, -.5, -.5, 0, .5, 0, -.2, 0, .2, 0, -.2, .95, .2, .95, -.2, 1.9, .2, 1.9];
 
 // ---------- networking ----------
 function connect() {
@@ -181,11 +206,19 @@ function tick() {
   lastVideoTime = video.currentTime;
   const now = performance.now();
 
+  curSrc = frameSource();
+  const [sw, sh] = dimsOf(curSrc);
+  if (sw !== W || sh !== H) {          // the phone was rotated: sizes changed, so start tracking fresh
+    W = sw; H = sh; canvas.width = W; canvas.height = H;
+    resetPlayers();
+    return;
+  }
+
   if (frameNo++ % poseEvery === 0) {
-    lastPose = { people: toPeople(pose.detectForVideo(video, now)) };
+    lastPose = { people: toPeople(pose.detectForVideo(curSrc, now)) };
     updateTracks(lastPose.people, now);
   }
-  lastHands = (hands.detectForVideo(video, now).landmarks || [])
+  lastHands = (hands.detectForVideo(curSrc, now).landmarks || [])
     .map((h) => h.map((l) => ({ x: (1 - l.x) * W, y: l.y * H })));
 
   const players = [buildPlayer(1, now), buildPlayer(2, now)];
@@ -194,7 +227,7 @@ function tick() {
   if (showPreview) draw(players);
   chip('cP1', 'Player 1: ' + (players[0].msg.on ? 'ready' : 'not seen'), players[0].msg.on);
   chip('cP2', 'Player 2: ' + (players[1].msg.on ? 'ready' : 'not seen'), players[1].msg.on);
-  if (!calibrated) say(lastPose.people.length < 2 ? 'Waiting for two players. Stand apart, full body in view.' : 'Stand a bit further apart...');
+  if (!calibrated) say(solo ? 'Step back until your whole body is in view.' : lastPose.people.length < 2 ? 'Waiting for two players. Stand apart, full body in view.' : 'Stand a bit further apart...');
   else if (!($('msg').textContent && displayUp)) say('');
 
   fpsCount++;
@@ -211,20 +244,29 @@ function toPeople(res) {
   const out = [];
   for (const lm of res.landmarks || []) {
     const p = lm.map((l) => ({ x: (1 - l.x) * W, y: l.y * H, v: l.visibility ?? 1 }));
-    if (p[11].v < 0.4 || p[12].v < 0.4 || p[23].v < 0.3 || p[24].v < 0.3) continue; // need torso in view
+    if (p[11].v < 0.3 || p[12].v < 0.3 || p[23].v < 0.2 || p[24].v < 0.2) continue; // need torso in view
     const hip = mid(p[23], p[24]), sh = mid(p[11], p[12]);
     out.push({ p, hip, torso: Math.hypot(hip.x - sh.x, hip.y - sh.y) });
   }
-  return out;
+  // The detector sometimes reports one person twice. Keep the larger of any near-duplicates.
+  out.sort((a, b) => b.torso - a.torso);
+  return out.filter((q, i) => out.slice(0, i).every((k) => Math.hypot(q.hip.x - k.hip.x, q.hip.y - k.hip.y) > 1.2 * k.torso));
 }
 
 // Identity: lock P1 = left, P2 = right once, then follow each person by nearest predicted hip.
 function updateTracks(people, now) {
+  if (solo) {
+    if (!people.length) return;
+    if (!calibrated) { tracks = [newTrack(people[0], now), null]; calibrated = true; return; }
+    const d = (q) => Math.hypot(q.hip.x - tracks[0].hip.x, q.hip.y - tracks[0].hip.y);
+    apply(tracks[0], people.reduce((a, b) => (d(a) <= d(b) ? a : b)), now);
+    return;
+  }
   if (!calibrated) {
     if (people.length < 2) return;
     const s = [...people].sort((a, b) => a.hip.x - b.hip.x);
     const L = s[0], R = s[s.length - 1];
-    if (R.hip.x - L.hip.x < W * 0.2) return;
+    if (R.hip.x - L.hip.x < Math.max(W * 0.2, 2 * L.torso)) return;
     tracks = [newTrack(L, now), newTrack(R, now)];
     calibrated = true;
     return;
@@ -264,7 +306,8 @@ function apply(t, person, now) {
 
 function buildPlayer(id, now) {
   const t = tracks[id - 1];
-  if (!t || now - t.seen > 600) return { msg: { p: id, on: false } };
+  if (solo && id === 2) return { msg: { p: 2, on: true, x: 0.8, pts: DUMMY, dir: [0.2, -1], sh: 6 } };
+  if (!t || now - t.seen > 1500) return { msg: { p: id, on: false } };
   const P = t.pts, hip = mid(P[23], P[24]), sh = mid(P[11], P[12]);
   t.torso += (Math.hypot(hip.x - sh.x, hip.y - sh.y) - t.torso) * 0.15;
   const torso = Math.max(t.torso, 30);
@@ -297,11 +340,11 @@ const BONES = [[11, 12], [11, 13], [13, 15], [12, 14], [14, 16], [11, 23], [12, 
 function draw(players) {
   ctx.save();
   ctx.translate(W, 0); ctx.scale(-1, 1);       // mirror the video to match the display
-  ctx.drawImage(video, 0, 0, W, H);
+  ctx.drawImage(curSrc, 0, 0, W, H);
   ctx.restore();
   ['#4aa3ff', '#ff5a5a'].forEach((color, i) => {
     const pl = players[i];
-    if (!pl.msg.on) return;
+    if (!pl.msg.on || !pl.P) return;
     ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 4;
     ctx.beginPath();
     for (const [a, b] of BONES) { ctx.moveTo(pl.P[a].x, pl.P[a].y); ctx.lineTo(pl.P[b].x, pl.P[b].y); }
