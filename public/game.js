@@ -1,359 +1,324 @@
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Pocket Katana - Camera</title>
-<style>
-  :root { --ink:#e9edff; --night:#0b1026; --panel:#121a45; --blue:#4aa3ff; --red:#ff5a5a; --ok:#6be28f; }
-  * { box-sizing: border-box; }
-  body { margin:0; min-height:100vh; background:var(--night); color:var(--ink); font-family: system-ui, "Segoe UI", sans-serif; }
-  main { max-width:720px; margin:0 auto; padding:20px 16px 40px; }
-  h1 { font:900 clamp(32px,7vw,52px)/1 Impact, "Arial Narrow Bold", sans-serif; margin:8px 0 16px; }
-  p { color:#aeb6e6; line-height:1.5; margin:0 0 16px; }
-  label { display:flex; gap:10px; align-items:center; margin:10px 0; }
-  button { font:700 20px system-ui, sans-serif; padding:14px 22px; border:0; border-radius:12px; background:var(--blue); color:#06122e; cursor:pointer; }
-  button.ghost { background:transparent; color:var(--ink); border:2px solid #3a4486; font-size:16px; padding:10px 16px; }
-  button:disabled { opacity:.5; cursor:default; }
-  button:focus-visible, input:focus-visible { outline:3px solid var(--blue); outline-offset:3px; }
-  #codeBox { background:var(--panel); border-radius:16px; padding:18px; margin:16px 0; text-align:center; }
-  #code { font:700 clamp(56px,16vw,96px)/1 ui-monospace, Menlo, Consolas, monospace; letter-spacing:.25em; padding-left:.25em; }
-  .row { display:flex; flex-wrap:wrap; gap:8px; margin:12px 0; }
-  .chip { padding:6px 12px; border-radius:999px; background:var(--panel); font-size:15px; }
-  .chip.ok { background:#16422a; color:var(--ok); }
-  canvas { width:100%; border-radius:12px; background:#000; display:block; }
-  #msg { min-height:1.5em; color:#ffd48a; }
-  [hidden] { display:none !important; }
-</style>
-</head>
-<body>
-<main>
-  <h1>CAMERA</h1>
+// Pure game logic. No DOM, no network, no audio: it only emits events through `ev`.
+// Keeping it this way means the same module can later run on a server for online play.
 
-  <section id="setup">
-    <p>Prop this device up facing the players, a few meters back, so both players' whole bodies are in view. Landscape works best. Keep the lights on.</p>
-    <label><input type="checkbox" id="lefty"> Sword in left hand</label>
-    <label><input type="checkbox" id="preview" checked> Show camera preview (turn off to save battery)</label>
-    <label><input type="checkbox" id="solo"> Practice alone (a dummy stands in as Player 2)</label>
-    <button id="go">Start camera</button>
-  </section>
+export const W = 1600;
+export const H = 900;
+export const GROUND = 790;
+export const S = 90;                  // one torso length, in arena pixels
+export const BLADE = 380;             // the "2 m" sword
+export const HIP_Y = GROUND - 1.9 * S;
 
-  <section id="live" hidden>
-    <div id="codeBox">
-      <div>Enter this code on the display at <b id="displayUrl"></b></div>
-      <div id="code" aria-live="polite">----</div>
-    </div>
-    <div class="row">
-      <span class="chip" id="cDisplay">Display: waiting</span>
-      <span class="chip" id="cP1">Player 1: not seen</span>
-      <span class="chip" id="cP2">Player 2: not seen</span>
-      <span class="chip" id="cFps">-- fps</span>
-    </div>
-    <p id="msg"></p>
-    <canvas id="view" width="640" height="480"></canvas>
-    <div class="row"><button class="ghost" id="rotate">Rotate view</button><button class="ghost" id="reset">Re-detect players</button></div>
-  </section>
-</main>
+const MARGIN = 140;
+const MIN_GAP = 150;
+const SLASH_SPEED = 2200;             // blade-tip px/s that counts as a slash
+const SLASH_MS = 220;
+const SLASH_COOLDOWN = 350;
+const HIT_DAMAGE = 14;
+const HIT_COOLDOWN = 600;
+const HIT_RADIUS = 20;
+const HEAD_RADIUS = 34;
+const CLASH_RADIUS = 16;
+const LOST_MS = 2500;                 // player out of frame this long -> pause
+const STALE_MS = 1200;                 // no tracker data this long -> player is "off"
+const READY_MS = 1500;
+const STEP_MS = 900;
+const ROUNDS_TO_WIN = 2;
 
-<script type="module">
-import { FilesetResolver, HandLandmarker, PoseLandmarker }
-  from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
-import { Net } from './net.js';
+// Indices into the 13 tracked points: 0 nose, 1/2 shoulders, 3/4 elbows, 5/6 wrists,
+// 7/8 hips, 9/10 knees, 11/12 ankles.
+export const BONES = [[1, 2], [1, 3], [3, 5], [2, 4], [4, 6], [1, 7], [2, 8], [7, 8], [7, 9], [9, 11], [8, 10], [10, 12]];
+const REST = [0, -1.5, -.4, -1, .4, -1, -.5, -.5, .5, -.5, -.5, 0, .5, 0, -.2, 0, .2, 0, -.2, .95, .2, .95, -.2, 1.9, .2, 1.9];
+const STEPS = ['3', '2', '1', 'FIGHT!'];
+const SAY = ['Three', 'Two', 'One', 'Fight!'];
 
-const WASM = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
-// Self-host these two files for a real launch so you don't depend on Google's bucket.
-const POSE_MODEL = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
-const HAND_MODEL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
-
-const $ = (id) => document.getElementById(id);
-const video = document.createElement('video');
-video.playsInline = true; video.muted = true;
-const canvas = $('view'), ctx = canvas.getContext('2d');
-
-// Pose landmark indices we send, in order: nose, shoulders, elbows, wrists, hips, knees, ankles.
-const KEYS = [0, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28];
-const r3 = (v) => Math.round(v * 1000) / 1000;
-const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+// ---------- geometry ----------
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
-let W = 640, H = 480;
-let pose, hands, net;
-let room = { code: null, token: null };
-let displayUp = false;
-let calibrated = false;
-let tracks = [null, null];
-let poseEvery = 1, frameNo = 0, lastVideoTime = -1;
-let fpsCount = 0, fpsStart = performance.now();
-let lefty = false, showPreview = true, solo = false, rot = 0, curSrc = video;
-let lastPose = { people: [] }, lastHands = [];
-
-// ---------- start ----------
-$('go').addEventListener('click', async () => {
-  $('go').disabled = true;
-  lefty = $('lefty').checked;
-  showPreview = $('preview').checked;
-  solo = $('solo').checked;
-  try {
-    $('go').textContent = 'Opening camera...';
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: { ideal: 'environment' }, width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } },
-      audio: false,
-    });
-    video.srcObject = stream;
-    await video.play();
-    W = video.videoWidth; H = video.videoHeight;
-    canvas.width = W; canvas.height = H;
-    stream.getVideoTracks()[0].addEventListener('ended', () => say('The camera stopped. Reload this page.'));
-
-    $('go').textContent = 'Loading tracking models...';
-    const fileset = await FilesetResolver.forVisionTasks(WASM);
-    pose = await make(PoseLandmarker, fileset, POSE_MODEL, { numPoses: 2 });
-    hands = await make(HandLandmarker, fileset, HAND_MODEL, { numHands: 4 });
-
-    $('setup').hidden = true;
-    $('live').hidden = false;
-    $('displayUrl').textContent = location.origin + '/display';
-    keepAwake();
-    connect();
-    requestAnimationFrame(tick);
-  } catch (e) {
-    console.error(e);
-    $('go').disabled = false;
-    $('go').textContent = 'Start camera';
-    alert(e && e.name === 'NotAllowedError'
-      ? 'Camera permission was denied. Allow camera access in your browser settings and try again.'
-      : 'Could not start: ' + (e && e.message ? e.message : e) + '\n(Cameras need HTTPS, or localhost.)');
-  }
-});
-
-async function make(Cls, fileset, model, extra) {
-  for (const delegate of ['GPU', 'CPU']) {
-    try {
-      return await Cls.createFromOptions(fileset, { baseOptions: { modelAssetPath: model, delegate }, runningMode: 'VIDEO', ...extra });
-    } catch (e) { console.warn(Cls.name, delegate, e); }
-  }
-  throw new Error('Could not load the tracking model');
+export function ptSeg(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const l = dx * dx + dy * dy;
+  const t = l ? clamp(((px - ax) * dx + (py - ay) * dy) / l, 0, 1) : 0;
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
 }
 
-async function keepAwake() {
-  try { if ('wakeLock' in navigator) await navigator.wakeLock.request('screen'); } catch { /* optional */ }
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') keepAwake();
-  }, { once: true });
+const cross = (ax, ay, bx, by) => ax * by - ay * bx;
+
+function segsCross(a, b, c, d) {
+  const d1 = cross(b[0] - a[0], b[1] - a[1], c[0] - a[0], c[1] - a[1]);
+  const d2 = cross(b[0] - a[0], b[1] - a[1], d[0] - a[0], d[1] - a[1]);
+  const d3 = cross(d[0] - c[0], d[1] - c[1], a[0] - c[0], a[1] - c[1]);
+  const d4 = cross(d[0] - c[0], d[1] - c[1], b[0] - c[0], b[1] - c[1]);
+  return d1 * d2 < 0 && d3 * d4 < 0;
 }
 
-function resetPlayers() { calibrated = false; tracks = [null, null]; }
-$('reset').addEventListener('click', resetPlayers);
-$('rotate').addEventListener('click', () => { rot = (rot + 90) % 360; resetPlayers(); say('View rotated to ' + rot + ' degrees'); });
-
-// Some phones hand us a sideways or upside-down image in landscape. Rotating the frame
-// before detection fixes that, because the pose model fails on rotated people.
-const off = document.createElement('canvas'), octx = off.getContext('2d');
-function frameSource() {
-  if (!rot) return video;
-  const vw = video.videoWidth, vh = video.videoHeight;
-  const swap = rot === 90 || rot === 270;
-  const ow = swap ? vh : vw, oh = swap ? vw : vh;
-  if (off.width !== ow || off.height !== oh) { off.width = ow; off.height = oh; }
-  octx.save();
-  octx.translate(ow / 2, oh / 2);
-  octx.rotate(rot * Math.PI / 180);
-  octx.drawImage(video, -vw / 2, -vh / 2, vw, vh);
-  octx.restore();
-  return off;
-}
-const dimsOf = (src) => (src === video ? [video.videoWidth, video.videoHeight] : [src.width, src.height]);
-
-// Stand-in opponent for practice mode.
-const DUMMY = [0, -1.5, -.4, -1, .4, -1, -.5, -.5, .5, -.5, -.5, 0, .5, 0, -.2, 0, .2, 0, -.2, .95, .2, .95, -.2, 1.9, .2, 1.9];
-
-// ---------- networking ----------
-function connect() {
-  net = new Net(onMsg, (s) => { if (s === 'closed') { displayUp = false; chip('cDisplay', 'Display: reconnecting', false); } });
-  net.onOpen = () => {
-    const saved = JSON.parse(sessionStorage.getItem('pk-room') || 'null');
-    net.send(saved ? { type: 'resume', code: saved.code, token: saved.token } : { type: 'create' });
-  };
-  net.connect();
+export function segDist(a, b, c, d) {
+  if (segsCross(a, b, c, d)) return 0;
+  return Math.min(
+    ptSeg(a[0], a[1], c[0], c[1], d[0], d[1]),
+    ptSeg(b[0], b[1], c[0], c[1], d[0], d[1]),
+    ptSeg(c[0], c[1], a[0], a[1], b[0], b[1]),
+    ptSeg(d[0], d[1], a[0], a[1], b[0], b[1]),
+  );
 }
 
-function onMsg(m) {
-  switch (m.type) {
-    case 'code':
-      room = { code: m.code, token: m.token };
-      sessionStorage.setItem('pk-room', JSON.stringify(room));
-      $('code').textContent = m.code;
-      break;
-    case 'ready': displayUp = true; chip('cDisplay', 'Display: connected', true); break;
-    case 'peer_left': displayUp = false; chip('cDisplay', 'Display: waiting', false); break;
-    case 'status': say(m.text); break;
-    case 'closed':
-    case 'error':
-      if (m.type === 'error' && m.message !== 'expired') return say(m.message);
-      sessionStorage.removeItem('pk-room');   // room is gone: make a fresh one
-      net.send({ type: 'create' });
-      break;
+// Point along segment a-b that is closest to segment c-d (sampled).
+function contactPoint(a, b, c, d) {
+  let best = a, bd = Infinity;
+  for (let i = 0; i <= 10; i++) {
+    const t = i / 10;
+    const x = a[0] + (b[0] - a[0]) * t, y = a[1] + (b[1] - a[1]) * t;
+    const dd = ptSeg(x, y, c[0], c[1], d[0], d[1]);
+    if (dd < bd) { bd = dd; best = [x, y]; }
   }
+  return best;
 }
 
-function chip(id, text, ok) { const el = $(id); el.textContent = text; el.classList.toggle('ok', !!ok); }
-function say(t) { $('msg').textContent = t || ''; }
-
-// ---------- tracking loop ----------
-function tick() {
-  requestAnimationFrame(tick);
-  if (video.readyState < 2 || video.currentTime === lastVideoTime) return;
-  lastVideoTime = video.currentTime;
-  const now = performance.now();
-
-  curSrc = frameSource();
-  const [sw, sh] = dimsOf(curSrc);
-  if (sw !== W || sh !== H) {          // the phone was rotated: sizes changed, so start tracking fresh
-    W = sw; H = sh; canvas.width = W; canvas.height = H;
-    resetPlayers();
-    return;
-  }
-
-  if (frameNo++ % poseEvery === 0) {
-    lastPose = { people: toPeople(pose.detectForVideo(curSrc, now)) };
-    updateTracks(lastPose.people, now);
-  }
-  lastHands = (hands.detectForVideo(curSrc, now).landmarks || [])
-    .map((h) => h.map((l) => ({ x: (1 - l.x) * W, y: l.y * H })));
-
-  const players = [buildPlayer(1, now), buildPlayer(2, now)];
-  if (displayUp && net) net.send({ type: 'state', d: { w: players.map((p) => p.msg) } });
-
-  if (showPreview) draw(players);
-  chip('cP1', 'Player 1: ' + (players[0].msg.on ? 'ready' : 'not seen'), players[0].msg.on);
-  chip('cP2', 'Player 2: ' + (players[1].msg.on ? 'ready' : 'not seen'), players[1].msg.on);
-  if (!calibrated) say(solo ? 'Step back until your whole body is in view.' : lastPose.people.length < 2 ? 'Waiting for two players. Stand apart, full body in view.' : 'Stand a bit further apart...');
-  else if (!($('msg').textContent && displayUp)) say('');
-
-  fpsCount++;
-  if (now - fpsStart > 1000) {
-    const fps = fpsCount * 1000 / (now - fpsStart);
-    $('cFps').textContent = Math.round(fps) + ' fps';
-    poseEvery = fps < 18 ? 2 : fps > 26 ? 1 : poseEvery;   // adapt: run pose less often on slow devices
-    fpsCount = 0; fpsStart = now;
-  }
-}
-
-// Convert MediaPipe output to mirrored pixel space (so the stickman acts like a mirror).
-function toPeople(res) {
-  const out = [];
-  for (const lm of res.landmarks || []) {
-    const p = lm.map((l) => ({ x: (1 - l.x) * W, y: l.y * H, v: l.visibility ?? 1 }));
-    if (p[11].v < 0.3 || p[12].v < 0.3 || p[23].v < 0.2 || p[24].v < 0.2) continue; // need torso in view
-    const hip = mid(p[23], p[24]), sh = mid(p[11], p[12]);
-    out.push({ p, hip, torso: Math.hypot(hip.x - sh.x, hip.y - sh.y) });
-  }
-  // The detector sometimes reports one person twice. Keep the larger of any near-duplicates.
-  out.sort((a, b) => b.torso - a.torso);
-  return out.filter((q, i) => out.slice(0, i).every((k) => Math.hypot(q.hip.x - k.hip.x, q.hip.y - k.hip.y) > 1.2 * k.torso));
-}
-
-// Identity: lock P1 = left, P2 = right once, then follow each person by nearest predicted hip.
-function updateTracks(people, now) {
-  if (solo) {
-    if (!people.length) return;
-    if (!calibrated) { tracks = [newTrack(people[0], now), null]; calibrated = true; return; }
-    const d = (q) => Math.hypot(q.hip.x - tracks[0].hip.x, q.hip.y - tracks[0].hip.y);
-    apply(tracks[0], people.reduce((a, b) => (d(a) <= d(b) ? a : b)), now);
-    return;
-  }
-  if (!calibrated) {
-    if (people.length < 2) return;
-    const s = [...people].sort((a, b) => a.hip.x - b.hip.x);
-    const L = s[0], R = s[s.length - 1];
-    if (R.hip.x - L.hip.x < Math.max(W * 0.2, 2 * L.torso)) return;
-    tracks = [newTrack(L, now), newTrack(R, now)];
-    calibrated = true;
-    return;
-  }
-  const pick = [...people].sort((a, b) => b.torso - a.torso).slice(0, 2);
-  const cost = (person, t) => {
-    const lead = clamp(t.vx * (now - t.seen) / 1000, -W * 0.15, W * 0.15);
-    return Math.hypot(person.hip.x - (t.hip.x + lead), person.hip.y - t.hip.y);
-  };
-  if (pick.length === 2) {
-    const straight = cost(pick[0], tracks[0]) + cost(pick[1], tracks[1]);
-    const swapped = cost(pick[0], tracks[1]) + cost(pick[1], tracks[0]);
-    if (straight <= swapped) { apply(tracks[0], pick[0], now); apply(tracks[1], pick[1], now); }
-    else { apply(tracks[0], pick[1], now); apply(tracks[1], pick[0], now); }
-  } else if (pick.length === 1) {
-    const c0 = cost(pick[0], tracks[0]), c1 = cost(pick[0], tracks[1]);
-    const i = c0 <= c1 ? 0 : 1;
-    if (Math.min(c0, c1) < W * 0.3) apply(tracks[i], pick[0], now);
-  }
-}
-
-function newTrack(person, now) {
-  return { pts: person.p.map((q) => ({ ...q })), hip: { ...person.hip }, vx: 0, torso: person.torso, dir: [1, 0], seen: now };
-}
-
-function apply(t, person, now) {
-  const dt = Math.max((now - t.seen) / 1000, 0.001);
-  t.vx += (clamp((person.hip.x - t.hip.x) / dt, -3000, 3000) - t.vx) * 0.3;
-  t.hip = { ...person.hip };
-  t.pts.forEach((q, i) => {
-    q.x += (person.p[i].x - q.x) * 0.55;
-    q.y += (person.p[i].y - q.y) * 0.55;
-    q.v = person.p[i].v;
-  });
-  t.seen = now;
-}
-
-function buildPlayer(id, now) {
-  const t = tracks[id - 1];
-  if (solo && id === 2) return { msg: { p: 2, on: true, x: 0.8, pts: DUMMY, dir: [0.2, -1], sh: 6 } };
-  if (!t || now - t.seen > 1500) return { msg: { p: id, on: false } };
-  const P = t.pts, hip = mid(P[23], P[24]), sh = mid(P[11], P[12]);
-  t.torso += (Math.hypot(hip.x - sh.x, hip.y - sh.y) - t.torso) * 0.15;
-  const torso = Math.max(t.torso, 30);
-
-  // Blade direction: the detected hand nearest to our sword-hand wrist, else the forearm.
-  const wi = lefty ? 15 : 16, ei = lefty ? 13 : 14, wr = P[wi];
-  let best = null, bd = Infinity;
-  for (const h of lastHands) {
-    const d = Math.hypot(h[0].x - wr.x, h[0].y - wr.y);
-    if (d < bd) { bd = d; best = h; }
-  }
-  let dx, dy;
-  if (best && bd < torso * 0.8) { dx = best[9].x - best[0].x; dy = best[9].y - best[0].y; }
-  else { dx = wr.x - P[ei].x; dy = wr.y - P[ei].y; }
-  const l = Math.hypot(dx, dy) || 1;
-  t.dir[0] += (dx / l - t.dir[0]) * 0.5;
-  t.dir[1] += (dy / l - t.dir[1]) * 0.5;
-
-  const pts = [];
-  for (const k of KEYS) pts.push(r3((P[k].x - hip.x) / torso), r3((P[k].y - hip.y) / torso));
+// ---------- fighters ----------
+function makeFighter(id) {
+  const x = id === 1 ? 450 : 1150;
   return {
-    msg: { p: id, on: true, x: r3(clamp(hip.x / W, 0, 1)), pts, dir: [r3(t.dir[0]), r3(t.dir[1])], sh: lefty ? 5 : 6 },
-    base: wr, tip: { x: wr.x + t.dir[0] * torso * 2.2, y: wr.y + t.dir[1] * torso * 2.2 },
-    P,
+    id, on: false, seen: 0,
+    tx: x, x, rel: REST.slice(),
+    dirT: [id === 1 ? 1 : -1, -0.3], dirv: [id === 1 ? 1 : -1, -0.3], hand: 6,
+    pts: [], base: [0, 0], tip: [0, 0], prevTip: null, speed: 0,
+    slashUntil: 0, lastSlash: 0, hitCd: 0, flashUntil: 0,
+    hp: 100, wins: 0, trail: [],
+    color: id === 1 ? '#4aa3ff' : '#ff5a5a',
   };
 }
 
-// ---------- preview ----------
-const BONES = [[11, 12], [11, 13], [13, 15], [12, 14], [14, 16], [11, 23], [12, 24], [23, 24], [23, 25], [25, 27], [24, 26], [26, 28]];
-function draw(players) {
-  ctx.save();
-  ctx.translate(W, 0); ctx.scale(-1, 1);       // mirror the video to match the display
-  ctx.drawImage(curSrc, 0, 0, W, H);
-  ctx.restore();
-  ['#4aa3ff', '#ff5a5a'].forEach((color, i) => {
-    const pl = players[i];
-    if (!pl.msg.on || !pl.P) return;
-    ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 4;
-    ctx.beginPath();
-    for (const [a, b] of BONES) { ctx.moveTo(pl.P[a].x, pl.P[a].y); ctx.lineTo(pl.P[b].x, pl.P[b].y); }
-    ctx.stroke();
-    ctx.lineWidth = 6;
-    ctx.beginPath(); ctx.moveTo(pl.base.x, pl.base.y); ctx.lineTo(pl.tip.x, pl.tip.y); ctx.stroke();
-    ctx.font = 'bold 22px system-ui'; ctx.fillText('P' + (i + 1), pl.P[0].x - 12, pl.P[0].y - 30);
-  });
+export class Game {
+  constructor(ev = {}) {
+    this.ev = ev;
+    this.f = [makeFighter(1), makeFighter(2)];
+    this.sparks = [];
+    this.cameraUp = false;
+    this.now = 0;
+    this.clashCd = 0;
+    this.shakeUntil = 0;
+    this.winner = 0;
+    this.banner = '';
+    this.sub = '';
+    this.readySince = 0;
+    this.lostSince = 0;
+    this.cdIdx = -1;
+    this.setState('waiting');
+  }
+
+  setState(s) {
+    this.state = s;
+    this.stateAt = this.now;
+  }
+
+  // d = { w: [{ p, on, x, pts[26], dir[2], sh }, ...] } as sent by the tracker page.
+  ingest(d, now) {
+    for (const w of (d && d.w) || []) {
+      const f = this.f[(w.p | 0) - 1];
+      if (!f) continue;
+      f.on = !!w.on;
+      if (!w.on || !Array.isArray(w.pts) || w.pts.length !== 26) continue;
+      f.seen = now;
+      f.tx = MARGIN + clamp(+w.x || 0, 0, 1) * (W - 2 * MARGIN);
+      for (let i = 0; i < 26; i++) {
+        const v = +w.pts[i];
+        if (Number.isFinite(v)) f.rel[i] += (clamp(v, -6, 6) - f.rel[i]) * 0.7;
+      }
+      if (Array.isArray(w.dir) && Number.isFinite(+w.dir[0]) && Number.isFinite(+w.dir[1])) {
+        f.dirT = [+w.dir[0], +w.dir[1]];
+      }
+      f.hand = w.sh === 5 ? 5 : 6;
+    }
+  }
+
+  update(dt, now) {
+    this.now = now;
+    const [a, b] = this.f;
+    for (const f of this.f) {
+      if (!this.cameraUp || (f.on && now - f.seen > STALE_MS)) f.on = false;
+    }
+    for (const f of this.f) f.x += (f.tx - f.x) * Math.min(1, dt * 10);
+    if (b.x - a.x < MIN_GAP) {
+      const m = (a.x + b.x) / 2;
+      a.x = m - MIN_GAP / 2;
+      b.x = m + MIN_GAP / 2;
+    }
+    for (const f of this.f) this.geometry(f, dt, now);
+    this.step(now);
+    this.updateSparks(dt);
+  }
+
+  geometry(f, dt, now) {
+    f.pts = [];
+    for (let i = 0; i < 13; i++) f.pts.push([f.x + f.rel[2 * i] * S, HIP_Y + f.rel[2 * i + 1] * S]);
+    const k = Math.min(1, dt * 18);
+    f.dirv[0] += (f.dirT[0] - f.dirv[0]) * k;
+    f.dirv[1] += (f.dirT[1] - f.dirv[1]) * k;
+    const len = Math.hypot(f.dirv[0], f.dirv[1]) || 1;
+    f.base = f.pts[f.hand];
+    f.tip = [f.base[0] + (f.dirv[0] / len) * BLADE, f.base[1] + (f.dirv[1] / len) * BLADE];
+    if (f.prevTip && dt > 0.0001) {
+      const sp = Math.hypot(f.tip[0] - f.prevTip[0], f.tip[1] - f.prevTip[1]) / dt;
+      f.speed += (Math.min(sp, 12000) - f.speed) * 0.5;
+    }
+    f.prevTip = f.tip;
+    f.trail.push({ b: f.base.slice(), t: f.tip.slice(), at: now });
+    while (f.trail.length && now - f.trail[0].at > 160) f.trail.shift();
+  }
+
+  // ---------- state machine ----------
+  step(now) {
+    const [a, b] = this.f;
+    const both = a.on && b.on;
+
+    switch (this.state) {
+      case 'waiting': {
+        this.banner = 'WAITING FOR PLAYERS';
+        this.sub = this.cameraUp
+          ? `Player 1 ${a.on ? 'ready' : 'not seen'}  |  Player 2 ${b.on ? 'ready' : 'not seen'}. Stand apart, one on each side, full body in view.`
+          : 'Camera disconnected. Reconnect the camera page.';
+        if (both) {
+          if (!this.readySince) this.readySince = now;
+          if (now - this.readySince > READY_MS) this.startCountdown(true);
+        } else this.readySince = 0;
+        break;
+      }
+      case 'countdown': {
+        if (!both && this.lostFor(now) > LOST_MS) return this.pause();
+        const idx = Math.floor((now - this.stateAt) / STEP_MS);
+        if (idx !== this.cdIdx && idx < STEPS.length) {
+          this.cdIdx = idx;
+          this.banner = STEPS[idx];
+          this.sub = '';
+          this.ev.say && this.ev.say(SAY[idx]);
+        }
+        if (idx >= STEPS.length) { this.banner = ''; this.setState('fight'); }
+        break;
+      }
+      case 'fight': {
+        if (!both && this.lostFor(now) > LOST_MS) return this.pause();
+        this.combat(now);
+        break;
+      }
+      case 'paused': {
+        this.banner = 'PAUSED';
+        this.sub = this.cameraUp ? 'A player left the frame. Step back in to continue.' : 'Camera disconnected.';
+        if (both) this.startCountdown(false);
+        break;
+      }
+      case 'roundover': {
+        this.banner = `PLAYER ${this.winner} WINS THE ROUND`;
+        this.sub = `${a.wins} - ${b.wins}`;
+        if (now - this.stateAt > 3500) this.startCountdown(true);
+        break;
+      }
+      case 'matchover': {
+        this.banner = `PLAYER ${this.winner} WINS THE MATCH`;
+        this.sub = `${a.wins} - ${b.wins}`;
+        if (now - this.stateAt > 5500) {
+          a.wins = b.wins = 0;
+          this.startCountdown(true);
+        }
+        break;
+      }
+    }
+  }
+
+  lostFor(now) {
+    if (!this.lostSince) this.lostSince = now;
+    return now - this.lostSince;
+  }
+
+  startCountdown(resetHp) {
+    if (resetHp) for (const f of this.f) f.hp = 100;
+    this.lostSince = 0;
+    this.readySince = 0;
+    this.cdIdx = -1;
+    this.setState('countdown');
+  }
+
+  pause() {
+    this.lostSince = 0;
+    this.setState('paused');
+  }
+
+  // ---------- combat ----------
+  combat(now) {
+    const [a, b] = this.f;
+    if (a.on && b.on) this.lostSince = 0;
+
+    for (const f of this.f) {
+      if (f.on && f.speed > SLASH_SPEED && now - f.lastSlash > SLASH_COOLDOWN) {
+        f.lastSlash = now;
+        f.slashUntil = now + SLASH_MS;
+        this.ev.slash && this.ev.slash(f);
+      }
+    }
+    if (!(a.on && b.on)) return;
+
+    const aAct = now < a.slashUntil, bAct = now < b.slashUntil;
+    if (now > this.clashCd && (aAct || bAct) && segDist(a.base, a.tip, b.base, b.tip) < CLASH_RADIUS) {
+      const p = contactPoint(a.base, a.tip, b.base, b.tip);
+      this.clashCd = now + 450;
+      a.slashUntil = b.slashUntil = 0;
+      a.hitCd = b.hitCd = now + 300;
+      a.x -= 45; b.x += 45;
+      this.shakeUntil = now + 180;
+      this.spawnSparks(p[0], p[1], 28, '#ffe9a8');
+      this.ev.clash && this.ev.clash(p[0], p[1]);
+      return;
+    }
+
+    for (const [att, def] of [[a, b], [b, a]]) {
+      if (now >= att.slashUntil || now < att.hitCd) continue;
+      const p = this.bladeHits(att, def);
+      if (!p) continue;
+      def.hp = Math.max(0, def.hp - HIT_DAMAGE - (att.speed > 3500 ? 6 : 0));
+      att.hitCd = now + HIT_COOLDOWN;
+      def.flashUntil = now + 200;
+      def.x += def.x > att.x ? 50 : -50;
+      this.shakeUntil = now + 140;
+      this.spawnSparks(p[0], p[1], 16, '#ff7a7a');
+      this.ev.hit && this.ev.hit(def);
+      if (def.hp <= 0) this.endRound(att);
+      return;
+    }
+  }
+
+  bladeHits(att, def) {
+    const h = def.pts[0];
+    if (ptSeg(h[0], h[1], att.base[0], att.base[1], att.tip[0], att.tip[1]) < HEAD_RADIUS) return h;
+    for (const [i, j] of BONES) {
+      if (segDist(att.base, att.tip, def.pts[i], def.pts[j]) < HIT_RADIUS) {
+        return contactPoint(att.base, att.tip, def.pts[i], def.pts[j]);
+      }
+    }
+    return null;
+  }
+
+  endRound(winner) {
+    this.winner = winner.id;
+    winner.wins++;
+    this.ev.ko && this.ev.ko();
+    const match = winner.wins >= ROUNDS_TO_WIN;
+    this.ev.say && this.ev.say(match ? `Player ${winner.id} wins the match` : `Player ${winner.id} wins`);
+    this.setState(match ? 'matchover' : 'roundover');
+  }
+
+  // ---------- particles ----------
+  spawnSparks(x, y, n, color) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2, s = 150 + Math.random() * 650;
+      this.sparks.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 150, life: 0.3 + Math.random() * 0.4, max: 0.7, color });
+    }
+  }
+
+  updateSparks(dt) {
+    for (const p of this.sparks) {
+      p.life -= dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.vy += 900 * dt;
+    }
+    this.sparks = this.sparks.filter((p) => p.life > 0);
+  }
 }
-</script>
-</body>
-</html>
